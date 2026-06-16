@@ -1,0 +1,370 @@
+// Verdant LMS — Prisma schema (multi-tenant SaaS)
+// Data model: organizations (tenants), users + per-org memberships/roles,
+// courses → modules → lessons, enrollment, live classes (Zoom), recordings,
+// attendance, announcements, notifications.
+//
+// Tenancy: every tenant-owned row carries an `organizationId`. A global `User`
+// (unique email) joins many organizations through `Membership`, which holds the
+// user's role *within that org*. Platform operators carry a `platformRole`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+
+// Role a user holds *within a single organization* (lives on Membership).
+enum Role {
+  STUDENT
+  TEACHER
+  ADMIN
+}
+
+// Platform-level role (the SaaS operator), independent of any organization.
+enum PlatformRole {
+  SUPER_ADMIN
+}
+
+enum OrgStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+}
+
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  COMPLETED
+  DROPPED
+}
+
+enum LessonType {
+  VIDEO
+  PDF
+  LINK
+  TEXT
+}
+
+enum LiveClassStatus {
+  SCHEDULED
+  LIVE
+  ENDED
+  CANCELLED
+}
+
+enum RecordingStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum AttendanceStatus {
+  PRESENT
+  PARTIAL
+  ABSENT
+}
+
+enum NotificationType {
+  ANNOUNCEMENT
+  LIVE_CLASS_SCHEDULED
+  LIVE_CLASS_STARTING
+  RECORDING_READY
+  ENROLLMENT
+  GENERIC
+}
+
+// ---------- Tenancy ----------
+
+model Organization {
+  id     String    @id @default(cuid())
+  name   String
+  slug   String    @unique // used in the per-org Zoom webhook URL and for display
+  status OrgStatus @default(ACTIVE)
+
+  // Per-org Zoom (Server-to-Server OAuth app). Secrets are AES-256-GCM ciphertext.
+  zoomAccountId        String?
+  zoomClientId         String?
+  zoomClientSecretEnc  String?
+  zoomWebhookSecretEnc String?
+
+  // Per-org object storage (S3-compatible). Secret key is encrypted.
+  s3Endpoint     String?
+  s3Region       String?
+  s3Bucket       String?
+  s3AccessKey    String?
+  s3SecretKeyEnc String?
+  s3PublicUrl    String?
+
+  memberships   Membership[]
+  courses       Course[]
+  enrollments   Enrollment[]
+  liveClasses   LiveClass[]
+  recordings    Recording[]
+  announcements Announcement[]
+  notifications Notification[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// A user's membership in (and role within) one organization.
+model Membership {
+  id     String     @id @default(cuid())
+  userId String
+  orgId  String
+  role   Role       @default(STUDENT)
+  status UserStatus @default(ACTIVE)
+
+  // Zoom host mapping (teachers only): the Zoom user id/email used as meeting
+  // host *for this org's* Zoom account.
+  zoomUserId String?
+
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, orgId])
+  @@index([orgId, role])
+}
+
+// ---------- Core ----------
+
+model User {
+  id           String        @id @default(cuid())
+  name         String
+  email        String        @unique
+  passwordHash String
+  avatarUrl    String?
+  platformRole PlatformRole? // set for platform operators; null for normal users
+
+  memberships   Membership[]
+  ownedCourses  Course[]       @relation("CourseOwner")
+  enrollments   Enrollment[]
+  hostedClasses LiveClass[]    @relation("LiveClassHost")
+  attendance    Attendance[]
+  announcements Announcement[] @relation("AnnouncementAuthor")
+  notifications Notification[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Course {
+  id          String       @id @default(cuid())
+  code        String
+  title       String
+  description String?      @db.Text
+  coverColor  String? // small UI accent per course
+  term        String?
+  status      CourseStatus @default(DRAFT)
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  ownerTeacherId String
+  owner          User   @relation("CourseOwner", fields: [ownerTeacherId], references: [id])
+
+  modules       Module[]
+  enrollments   Enrollment[]
+  liveClasses   LiveClass[]
+  recordings    Recording[]
+  announcements Announcement[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Course codes are unique within an organization, not globally.
+  @@unique([organizationId, code])
+  @@index([ownerTeacherId])
+}
+
+model Enrollment {
+  id       String           @id @default(cuid())
+  userId   String
+  courseId String
+  status   EnrollmentStatus @default(ACTIVE)
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, courseId])
+  @@index([courseId])
+  @@index([organizationId])
+}
+
+model Module {
+  id       String @id @default(cuid())
+  courseId String
+  title    String
+  position Int    @default(0)
+
+  course  Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  lessons Lesson[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([courseId])
+}
+
+model Lesson {
+  id       String     @id @default(cuid())
+  moduleId String
+  title    String
+  type     LessonType @default(TEXT)
+  position Int        @default(0)
+
+  // Content: either an uploaded object (fileKey in MinIO) or an external/text payload.
+  fileKey String?
+  url     String?
+  body    String? @db.Text
+
+  module Module @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([moduleId])
+}
+
+model LiveClass {
+  id             String          @id @default(cuid())
+  courseId       String
+  title          String
+  scheduledStart DateTime
+  durationMins   Int             @default(60)
+  status         LiveClassStatus @default(SCHEDULED)
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  // Zoom integration
+  hostUserId    String
+  zoomMeetingId String?
+  joinUrl       String?
+  startUrl      String? // host-only link
+  passcode      String?
+
+  startedAt DateTime?
+  endedAt   DateTime?
+
+  course     Course       @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  host       User         @relation("LiveClassHost", fields: [hostUserId], references: [id])
+  recordings Recording[]
+  attendance Attendance[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Meeting ids only need to be unique within one org's Zoom account.
+  @@unique([organizationId, zoomMeetingId])
+  @@index([courseId])
+  @@index([scheduledStart])
+}
+
+model Recording {
+  id          String          @id @default(cuid())
+  courseId    String
+  liveClassId String?
+  title       String
+  status      RecordingStatus @default(PENDING)
+
+  // Stored in our MinIO bucket once the worker downloads it from Zoom.
+  fileKey      String?
+  playUrl      String?
+  durationMins Int?
+  sizeBytes    BigInt?
+  recordedAt   DateTime?
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  course    Course     @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  liveClass LiveClass? @relation(fields: [liveClassId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([courseId])
+  @@index([organizationId])
+}
+
+model Attendance {
+  id           String           @id @default(cuid())
+  liveClassId  String
+  userId       String
+  joinTime     DateTime?
+  leaveTime    DateTime?
+  durationMins Int              @default(0)
+  status       AttendanceStatus @default(ABSENT)
+
+  liveClass LiveClass @relation(fields: [liveClassId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([liveClassId, userId])
+  @@index([userId])
+}
+
+model Announcement {
+  id       String @id @default(cuid())
+  courseId String
+  authorId String
+  body     String @db.Text
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  course Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  author User   @relation("AnnouncementAuthor", fields: [authorId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([courseId])
+  @@index([organizationId])
+}
+
+model Notification {
+  id     String           @id @default(cuid())
+  userId String
+  type   NotificationType @default(GENERIC)
+  title  String
+  body   String?
+  href   String?
+  readAt DateTime?
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt])
+  @@index([organizationId])
+}

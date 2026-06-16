@@ -1,0 +1,60 @@
+# Production stack for a single VPS: app + worker + Redis + Nginx.
+# Postgres is Supabase (set DATABASE_URL in .env) and object storage is AWS S3
+# (configured per-organization in the app's platform settings) — neither runs here,
+# so nothing stateful lives on the box except the Redis queue.
+#
+# Usage:
+#   1. Fill in .env:
+#        DATABASE_URL  -> Supabase pooler URL (port 6543, append ?pgbouncer=true)
+#        AUTH_SECRET, AUTH_URL=https://your-domain
+#        ZOOM_* , SMTP_*
+#   2. docker compose -f docker-compose.prod.yml up -d --build
+#   3. docker compose -f docker-compose.prod.yml exec web npx prisma migrate deploy
+#
+# S3 is set up later inside the app (platform org settings: bucket, region,
+# access key/secret, public URL) — no S3 env vars are needed here.
+#
+# REDIS_URL is injected below so it points at the internal redis service and
+# overrides any localhost value in .env.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+
+  web:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+    depends_on:
+      redis: { condition: service_started }
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["npm", "run", "start:worker"]
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+    depends_on:
+      redis: { condition: service_started }
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on: [web]
+
+volumes:
+  redisdata:

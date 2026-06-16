@@ -1,0 +1,18 @@
+# Local development infrastructure for Verdant LMS.
+# Postgres is Supabase (DATABASE_URL in .env) and object storage is AWS S3
+# (configured per-org in the app), so only Redis runs locally. Run:
+#   docker compose up -d
+# The Next.js app + worker run on the host (npm run dev / npm run worker)
+# against Supabase, S3, and this Redis.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+volumes:
+  redisdata:
