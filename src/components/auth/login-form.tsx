@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState } from "react";
+import { useActionState, useEffect } from "react";
 import { useFormStatus } from "react-dom";
 import { AlertCircle, Loader2, LogIn } from "lucide-react";
 import { authenticate } from "@/app/login/actions";
@@ -8,22 +8,32 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-function SubmitButton() {
+function SubmitButton({ busy }: { busy?: boolean }) {
   const { pending } = useFormStatus();
+  const loading = pending || busy;
   return (
-    <Button type="submit" disabled={pending} className="h-11 w-full text-sm">
-      {pending ? (
+    <Button type="submit" disabled={loading} className="h-11 w-full text-sm">
+      {loading ? (
         <Loader2 className="size-4 animate-spin" />
       ) : (
         <LogIn className="size-4" />
       )}
-      {pending ? "Signing in…" : "Sign in"}
+      {loading ? "Signing in…" : "Sign in"}
     </Button>
   );
 }
 
 export function LoginForm() {
   const [state, formAction] = useActionState(authenticate, undefined);
+
+  useEffect(() => {
+    if (state?.ok) {
+      // Full-document navigation so the dashboard renders fresh with the
+      // session cookie that signIn just set — avoids the stale soft-nav
+      // where the URL changes but the page doesn't load until a manual reload.
+      window.location.assign("/dashboard");
+    }
+  }, [state]);
 
   return (
     <form action={formAction} className="space-y-4">
@@ -60,7 +70,7 @@ export function LoginForm() {
         </div>
       )}
 
-      <SubmitButton />
+      <SubmitButton busy={state?.ok} />
     </form>
   );
 }
